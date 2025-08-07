@@ -1,0 +1,147 @@
+from airflow.providers.google.cloud.hooks.dataproc import DataprocHook
+from airflow.providers.google.cloud.utils.dataproc import DataprocJobBuilder
+from airflow.exceptions import AirflowException
+
+from typing import List, Optional
+import logging
+
+
+class SparkService:
+    def __init__(
+        self,
+        project_id: str,
+        region: str,
+        cluster_name: Optional[str] = None,
+        serverless: bool = False,
+        gcp_conn_id: str = "google_cloud_default"
+    ):
+        """
+        SparkService abstracts Spark job submission to Dataproc (cluster or serverless).
+        """
+        self.project_id = project_id
+        self.region = region
+        self.cluster_name = cluster_name
+        self.serverless = serverless
+        self.gcp_conn_id = gcp_conn_id
+
+        self.hook = DataprocHook(
+            gcp_conn_id=self.gcp_conn_id,
+            region=self.region,
+            project_id=self.project_id
+        )
+
+        if not self.cluster_name and not self.serverless:
+            raise ValueError("Either 'cluster_name' or 'serverless=True' must be provided.")
+
+    def submit_pyspark_job(
+        self,
+        script_uri: str,
+        arguments: Optional[List[str]] = None,
+        job_labels: Optional[dict] = None
+    ) -> str:
+        """
+        Submits a PySpark job to Dataproc (cluster or serverless).
+        """
+        try:
+            job_builder = DataprocJobBuilder(
+                project_id=self.project_id,
+                task_id="spark_pyspark_job",
+                job_type="pyspark",
+                properties={},
+                main=script_uri,
+                arguments=arguments or [],
+                region=self.region,
+                gcp_conn_id=self.gcp_conn_id,
+                labels=job_labels or {},
+            )
+
+            if self.serverless:
+                # Serverless jobs don’t need cluster placement
+                job_builder.job["placement"] = {"cluster_uuid": ""}
+                job_builder.job["pyspark_job"]["runtime_config"] = {"version": "2.0"}  # Optional
+            else:
+                job_builder.set_cluster_name(self.cluster_name)
+
+            job = job_builder.build()
+            operation = self.hook.submit_job(job)
+            job_id = operation["reference"]["jobId"]
+            logging.info(f"Submitted PySpark job: {job_id}")
+            return job_id
+
+        except Exception as e:
+            logging.error(f"Failed to submit PySpark job: {e}")
+            raise AirflowException(f"Spark job submission failed: {e}")
+
+    def submit_spark_sql_job(
+        self,
+        query: str,
+        job_labels: Optional[dict] = None
+    ) -> str:
+        """
+        Submits a Spark SQL query.
+        """
+        try:
+            job_builder = DataprocJobBuilder(
+                project_id=self.project_id,
+                task_id="spark_sql_job",
+                job_type="spark_sql",
+                query=query,
+                region=self.region,
+                gcp_conn_id=self.gcp_conn_id,
+                labels=job_labels or {}
+            )
+
+            if not self.serverless:
+                job_builder.set_cluster_name(self.cluster_name)
+
+            job = job_builder.build()
+            operation = self.hook.submit_job(job)
+            job_id = operation["reference"]["jobId"]
+            logging.info(f"Submitted Spark SQL job: {job_id}")
+            return job_id
+
+        except Exception as e:
+            logging.error(f"Failed to submit Spark SQL job: {e}")
+            raise AirflowException(f"Spark SQL job submission failed: {e}")
+
+    def monitor_job(self, job_id: str):
+        """
+        Monitors a Dataproc job until it completes.
+        """
+        try:
+            logging.info(f"Monitoring Dataproc job: {job_id}")
+            result = self.hook.wait_for_job(job_id=job_id)
+            logging.info(f"Job {job_id} completed with state: {result['status']['state']}")
+            return result["status"]["state"]
+
+        except Exception as e:
+            logging.error(f"Error while monitoring job {job_id}: {e}")
+            raise AirflowException(f"Monitoring failed for job {job_id}: {e}")
+
+    def cancel_job(self, job_id: str):
+        """
+        Cancels a running Dataproc job.
+        """
+        try:
+            logging.info(f"Attempting to cancel job {job_id}")
+            self.hook.cancel_job(job_id=job_id)
+            logging.info(f"Job {job_id} cancellation requested.")
+
+        except Exception as e:
+            logging.error(f"Failed to cancel job {job_id}: {e}")
+            raise AirflowException(f"Job cancellation failed: {e}")
+
+    def get_job_logs(self, job_id: str) -> Optional[str]:
+        """
+        Retrieves Dataproc job output logs.
+        Note: This assumes logs are stored in GCS/logs by Dataproc config.
+        """
+        try:
+            job = self.hook.get_job(job_id)
+            driver_output_uri = job.get("driverOutputResourceUri")
+            logging.info(f"Job logs available at: {driver_output_uri}")
+            return driver_output_uri
+
+        except Exception as e:
+            logging.error(f"Failed to fetch logs for job {job_id}: {e}")
+            return None
