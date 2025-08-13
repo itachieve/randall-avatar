@@ -1,274 +1,239 @@
 from __future__ import annotations
 
-import shlex
-from typing import Callable, Optional, Sequence, Union, List, Dict, Any
+import time
+from typing import Any, Dict, Iterable, Optional
 
-from airflow.exceptions import AirflowException
-from airflow.providers.google.cloud.operators.dataproc import DataprocSubmitPySparkJobOperator
+from airflow.models import BaseOperator
+from airflow.utils.context import Context
 
-# The JobBuilder lives in different modules across provider versions; support both.
+# Airflow GCP provider bits
+from airflow.providers.google.cloud.hooks.dataproc import DataprocHook
 try:
-    from airflow.providers.google.cloud.hooks.dataproc import DataprocHook, DataProcJobBuilder
-except ImportError:  # older/newer provider fallback for builder location
-    from airflow.providers.google.cloud.hooks.dataproc import DataprocHook
+    # Most recent locations for the builder
+    from airflow.providers.google.cloud.utils.dataproc import DataProcJobBuilder
+except Exception:
+    # Fallback for older layouts (rare with 10.21.1, but keeps this class sturdier)
     from airflow.providers.google.cloud.operators.dataproc import DataProcJobBuilder  # type: ignore
 
 
-class SparkService(DataprocSubmitPySparkJobOperator):
+class SparkService(BaseOperator):
     """
-    Airflow task that submits a PySpark job to Dataproc via DataprocHook + DataProcJobBuilder.
+    A lean operator that builds & submits a Dataproc job (PySpark by default)
+    with:
+      - _log_gcloud_cli_equivalent(): log the equivalent gcloud command
+      - _wait_for_done(): poll until DONE / ERROR / CANCELLED
+      - __get_status(): small helper to read job status safely
 
-    Key traits
-    ----------
-    - No Jinja templating required/used.
-    - 'main' must be passed explicitly (no derivation).
-    - Optional runtime argument sources:
-        * arguments_resolver(context) -> List[str]
-        * xcom_args_from: pull a list from another task's XCom (return value by default).
-    - Behaviors:
-        * wait (default True): block for job completion.
-        * cancel_on_timeout (default False): if wait times out, call cancel_job and re-raise.
-        * emit_gcloud_log (default True): logs a faithful gcloud-equivalent command.
-
-    Returns
-    -------
-    Dataproc job_id (str) via XCom (execute() return value).
+    Defaults assume PySpark jobs; you can pass spark_properties / jars / files / archives / python_files, etc.
     """
 
-    # Intentionally no template_fields to avoid Jinja entirely.
-    template_fields: tuple = tuple()
+    template_fields = (
+        "project_id",
+        "region",
+        "cluster_name",
+        "main_python_file_uri",
+        "args",
+        "job_name",
+    )
 
     def __init__(
         self,
         *,
-        # ---- Original Dataproc operator params (explicit, no Jinja) ----
-        main: str,
-        cluster_name: str,
+        project_id: str,
         region: str,
-        project_id: Optional[str] = None,
+        cluster_name: str,
+        main_python_file_uri: str,
+        args: Optional[Iterable[str]] = None,
+        job_name: Optional[str] = None,
+        # Optional extras
         gcp_conn_id: str = "google_cloud_default",
-        impersonation_chain: Optional[Union[str, Sequence[str]]] = None,
-        pyfiles: Optional[List[str]] = None,
-        arguments: Optional[List[str]] = None,
-        files: Optional[List[str]] = None,
-        archives: Optional[List[str]] = None,
-        jars: Optional[List[str]] = None,
-        properties: Optional[Dict[str, str]] = None,
         labels: Optional[Dict[str, str]] = None,
+        properties: Optional[Dict[str, str]] = None,
+        python_files: Optional[Iterable[str]] = None,
+        files: Optional[Iterable[str]] = None,
+        archives: Optional[Iterable[str]] = None,
+        jars: Optional[Iterable[str]] = None,
+        service_account: Optional[str] = None,
+        wait_check_interval_seconds: int = 20,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.project_id = project_id
+        self.region = region
+        self.cluster_name = cluster_name
+        self.main_python_file_uri = main_python_file_uri
+        self.args = list(args or [])
+        self.job_name = job_name
 
-        # ---- Behavior flags ----
-        wait: bool = True,
-        wait_time: int = 10,
-        timeout: Optional[int] = None,
-        cancel_on_timeout: bool = False,
-        emit_gcloud_log: bool = True,
+        self.gcp_conn_id = gcp_conn_id
+        self.labels = labels or {}
+        self.properties = properties or {}
+        self.python_files = list(python_files or [])
+        self.files = list(files or [])
+        self.archives = list(archives or [])
+        self.jars = list(jars or [])
+        self.service_account = service_account
+        self.wait_check_interval_seconds = max(5, wait_check_interval_seconds)
 
-        # ---- Dynamic/no-Jinja options ----
-        arguments_resolver: Optional[Callable[[Dict[str, Any]], List[str]]] = None,
-        xcom_args_from: Optional[str] = None,  # task_id to pull a list of args from
+        # lazily created in execute()
+        self._hook: Optional[DataprocHook] = None
 
-        **kwargs,
-    ):
-        super().__init__(
-            main=main,
-            cluster_name=cluster_name,
-            region=region,
-            project_id=project_id,
-            gcp_conn_id=gcp_conn_id,
-            impersonation_chain=impersonation_chain,
-            pyfiles=pyfiles,
-            arguments=arguments,
-            files=files,
-            archives=archives,
-            jars=jars,
-            properties=properties,
-            labels=labels,
-            **kwargs,
-        )
+    # ----------- Airflow lifecycle -----------
 
-        # Controls:
-        self.wait = wait
-        self.wait_time = wait_time
-        self.timeout = timeout
-        self.cancel_on_timeout = cancel_on_timeout
-        self.emit_gcloud_log = emit_gcloud_log
+    def execute(self, context: Context) -> Dict[str, Any]:
+        """Builds a PySpark job payload, logs gcloud equivalent, submits, then blocks until completion."""
+        self._hook = DataprocHook(gcp_conn_id=self.gcp_conn_id)
 
-        # Dynamic/no-Jinja:
-        self.arguments_resolver = arguments_resolver
-        self.xcom_args_from = xcom_args_from
-
-    # -------------------------
-    # Airflow task entrypoint
-    # -------------------------
-    def execute(self, context):
-        # Resolve arguments without Jinja
-        resolved_arguments = self._resolve_arguments(context)
-
-        # Build job payload with builder, not just the base operator
-        job = self._build_job_payload(
-            main=self.main,
-            pyfiles=self.pyfiles,
-            arguments=resolved_arguments,
-            files=self.files,
-            archives=self.archives,
-            jars=self.jars,
-            properties=self.dataproc_properties,
-            labels=self.labels,
-        )
-
-        if self.emit_gcloud_log:
-            self._log_gcloud_equivalent(job)
-
-        # Submit job
-        hook = DataprocHook(
-            gcp_conn_id=self.gcp_conn_id,
-            region=self.region,
-            impersonation_chain=self.impersonation_chain,
-        )
-
-        try:
-            resp = hook.submit_job(job=job, project_id=self.project_id, region=self.region)
-            job_id = resp.reference.job_id  # provider returns Job proto-like object
-            self.log.info("Dataproc job submitted: %s", job_id)
-
-            # Optionally wait for completion
-            if self.wait:
-                try:
-                    hook.wait_for_job(
-                        job_id=job_id,
-                        project_id=self.project_id,
-                        region=self.region,
-                        wait_time=self.wait_time,
-                        timeout=self.timeout,
-                    )
-                    self.log.info("Dataproc job finished: %s", job_id)
-                except Exception as e:
-                    # On timeout or failure
-                    if self.cancel_on_timeout:
-                        self._safe_cancel_job(hook, job_id)
-                    raise
-
-            return job_id
-
-        except Exception as e:
-            # Ensure exception bubbles up so task is marked failed
-            self.log.exception("Dataproc submission/wait failed: %s", e)
-            raise
-
-    # -------------------------
-    # Helpers
-    # -------------------------
-    def _resolve_arguments(self, context) -> Optional[List[str]]:
-        # 1) Resolver callback wins if set
-        if self.arguments_resolver is not None:
-            args = self.arguments_resolver(context)
-            self._validate_args_list(args, source="arguments_resolver")
-            return args
-
-        # 2) Otherwise, XCom source if specified
-        if self.xcom_args_from:
-            ti = context.get("ti")
-            pulled = ti.xcom_pull(task_ids=self.xcom_args_from)
-            self._validate_args_list(pulled, source=f"XCom from {self.xcom_args_from}")
-            return pulled
-
-        # 3) Fallback to constructor-provided arguments (could be None)
-        return self.arguments
-
-    def _validate_args_list(self, value, source: str) -> None:
-        if value is None:
-            return
-        if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
-            raise AirflowException(
-                f"{source} must return/provide a List[str], got: {type(value).__name__}"
-            )
-
-    def _build_job_payload(
-        self,
-        *,
-        main: str,
-        pyfiles: Optional[List[str]],
-        arguments: Optional[List[str]],
-        files: Optional[List[str]],
-        archives: Optional[List[str]],
-        jars: Optional[List[str]],
-        properties: Optional[Dict[str, str]],
-        labels: Optional[Dict[str, str]],
-    ) -> Dict[str, Any]:
+        # Build the job payload with the DataProcJobBuilder
         builder = DataProcJobBuilder(
-            project_id=self.project_id,
-            task_id=self.task_id,
+            job_name=self.job_name,
             cluster_name=self.cluster_name,
-            job_type="pyspark_job",
-            properties=properties,
+            project_id=self.project_id,
+            labels=self.labels,
+            region=self.region,
         )
-        builder.set_python_main(main)
-        builder.add_python_file_uris(pyfiles)
-        builder.add_args(arguments)
-        builder.add_file_uris(files)
-        builder.add_archive_uris(archives)
-        builder.add_jar_file_uris(jars)
-        builder.add_labels(labels)
-        job = builder.build()
-        self.log.debug("Built Dataproc job payload: %s", job)
-        return job
 
-    def _log_gcloud_equivalent(self, job: Dict[str, Any]) -> None:
-        j = job.get("job", {})
-        spec = j.get("pyspark_job", {})
-        main = spec.get("main_python_file_uri", "")
-        cluster = j.get("placement", {}).get("cluster_name", "")
+        # Configure it as a PySpark job
+        builder.set_pyspark_job(
+            main=self.main_python_file_uri,
+            args=self.args,
+            jars=self.jars or None,
+            files=self.files or None,
+            archives=self.archives or None,
+            python_files=self.python_files or None,
+            properties=self.properties or None,
+            service_account=self.service_account or None,
+        )
 
-        cmd = [
-            "gcloud", "dataproc", "jobs", "submit", "pyspark", shlex.quote(main),
-            f"--cluster={shlex.quote(cluster)}",
-            f"--region={shlex.quote(self.region)}",
+        job_payload = builder.build()
+
+        # Log a friendly gcloud CLI equivalent for reproducibility
+        self._log_gcloud_cli_equivalent(job_payload)
+
+        # Submit the job
+        submitted = self._hook.submit_job(
+            project_id=self.project_id,
+            job=job_payload,
+            region=self.region,
+        )
+
+        # The response contains the server-side job reference (dict-like)
+        job_id = submitted.get("reference", {}).get("jobId")
+        if not job_id:
+            # Fallback: sometimes the returned object is a proto; be defensive:
+            ref = getattr(submitted, "reference", None)
+            job_id = getattr(ref, "job_id", None)
+
+        if not job_id:
+            raise RuntimeError("Failed to extract Dataproc jobId from submit response.")
+
+        self.log.info("Dataproc job submitted: %s", job_id)
+
+        # Block until it finishes
+        final = self._wait_for_done(job_id)
+        state, details = self.__get_status(final)
+
+        # Bubble up failures for task-state correctness
+        if state in {"ERROR", "CANCELLED"}:
+            raise RuntimeError(f"Dataproc job {job_id} ended in {state}: {details or 'no details'}")
+
+        self.log.info("Dataproc job %s finished with state %s", job_id, state)
+        return final
+
+    # ----------- Helpers -----------
+
+    def _log_gcloud_cli_equivalent(self, job: Dict[str, Any]) -> None:
+        """
+        Emits a 'close-enough' gcloud command that reproduces this job.
+        Focuses on PySpark jobs to keep the output compact.
+        """
+        project = self.project_id
+        region = self.region
+        cluster = job.get("placement", {}).get("clusterName") or self.cluster_name
+
+        pyspark = job.get("pysparkJob", {})  # type: ignore[assignment]
+        main = pyspark.get("mainPythonFileUri") or self.main_python_file_uri
+        args = pyspark.get("args", []) or self.args
+        jars = pyspark.get("jarFileUris", []) or self.jars
+        files = pyspark.get("fileUris", []) or self.files
+        archives = pyspark.get("archiveUris", []) or self.archives
+        pyfiles = pyspark.get("pythonFileUris", []) or self.python_files
+        props = (job.get("job", {}) or {}).get("properties") or job.get("properties") or self.properties
+
+        # Build the CLI with sensible escaping (basic; adjust if you need strict POSIX quoting)
+        parts = [
+            "gcloud dataproc jobs submit pyspark",
+            f"{self._shq(main)}",
+            f"--cluster={self._shq(cluster)}",
+            f"--region={self._shq(region)}",
+            f"--project={self._shq(project)}",
         ]
 
-        def add_list(flag: str, values: Optional[List[str]]):
-            if values:
-                cmd.append(f"{flag}={shlex.quote(','.join(values))}")
-
-        add_list("--py-files", spec.get("python_file_uris"))
-        add_list("--files", spec.get("file_uris"))
-        add_list("--archives", spec.get("archive_uris"))
-        add_list("--jars", spec.get("jar_file_uris"))
-
-        args = spec.get("args") or []
+        for k, v in (props or {}).items():
+            parts.append(f"--properties={self._shq(f'{k}={v}')}")
+        for j in jars:
+            parts.append(f"--jars={self._shq(j)}")
+        for f in files:
+            parts.append(f"--files={self._shq(f)}")
+        for a in archives:
+            parts.append(f"--archives={self._shq(a)}")
+        for p in pyfiles:
+            parts.append(f"--py-files={self._shq(p)}")
         if args:
-            cmd.append("-- " + " ".join(shlex.quote(a) for a in args))
+            parts.append("-- " + " ".join(self._shq(x) for x in args))
 
-        self.log.info("Equivalent gcloud command:\n%s", " \\\n  ".join(cmd))
+        cli = " ".join(parts)
+        self.log.info("gcloud equivalent:\n%s", cli)
 
-    # Public wrappers (useful from other tasks if needed)
-    def wait_for_job(self, job_id: str, wait_time: int = 10, timeout: Optional[int] = None) -> None:
-        hook = DataprocHook(
-            gcp_conn_id=self.gcp_conn_id,
-            region=self.region,
-            impersonation_chain=self.impersonation_chain,
-        )
-        hook.wait_for_job(job_id=job_id, project_id=self.project_id, region=self.region, wait_time=wait_time, timeout=timeout)
+    def _wait_for_done(self, job_id: str) -> Dict[str, Any]:
+        """
+        Poll the Dataproc job until it reaches a terminal state.
+        Returns the final job dict.
+        """
+        assert self._hook is not None, "Hook not initialized"
+        terminal_states = {"DONE", "ERROR", "CANCELLED"}
 
-    def get_job(self, job_id: str):
-        hook = DataprocHook(
-            gcp_conn_id=self.gcp_conn_id,
-            region=self.region,
-            impersonation_chain=self.impersonation_chain,
-        )
-        return hook.get_job(job_id=job_id, project_id=self.project_id, region=self.region)
+        while True:
+            job = self._hook.get_job(
+                project_id=self.project_id,
+                region=self.region,
+                job_id=job_id,
+            )
+            state, details = self.__get_status(job)
+            self.log.info("Job %s current state: %s%s", job_id, state, f" ({details})" if details else "")
 
-    def cancel_job(self, job_id: str) -> None:
-        hook = DataprocHook(
-            gcp_conn_id=self.gcp_conn_id,
-            region=self.region,
-            impersonation_chain=self.impersonation_chain,
-        )
-        hook.cancel_job(job_id=job_id, project_id=self.project_id, region=self.region)
+            if state in terminal_states:
+                return job
 
-    # Internal safety net for cancellation on timeout/failure
-    def _safe_cancel_job(self, hook: DataprocHook, job_id: str) -> None:
+            time.sleep(self.wait_check_interval_seconds)
+
+    def __get_status(self, job: Dict[str, Any]) -> tuple[str, Optional[str]]:
+        """
+        Safely extract (state, details) from the job object, working with dicts or proto-like objects.
+        """
+        # Dict-like path
         try:
-            self.log.warning("Cancelling Dataproc job due to timeout: %s", job_id)
-            hook.cancel_job(job_id=job_id, project_id=self.project_id, region=self.region)
-        except Exception as cancel_err:
-            self.log.warning("Failed to cancel Dataproc job %s: %s", job_id, cancel_err)
+            status = job.get("status", {})  # type: ignore[assignment]
+            state = status.get("state")
+            details = status.get("details")
+            if state:
+                return str(state), details
+        except Exception:
+            pass
+
+        # Proto-like path (defensive)
+        status = getattr(job, "status", None)
+        state = getattr(status, "state", None)
+        details = getattr(status, "details", None)
+        return (str(state) if state is not None else "UNKNOWN", details)
+
+    # ----------- tiny utils -----------
+
+    @staticmethod
+    def _shq(s: Any) -> str:
+        """Minimal shell-quoting to make the logged gcloud command safer to copy-paste."""
+        text = str(s)
+        if not text or any(c.isspace() for c in text) or any(c in text for c in "\"'\\$`"):
+            # wrap and escape single quotes by closing/opening; POSIX-lite
+            return "'" + text.replace("'", "'\"'\"'") + "'"
+        return text
