@@ -1,0 +1,144 @@
+from __future__ import annotations
+from typing import Any, Dict, Iterable, Optional
+
+from airflow.utils.context import Context
+from airflow.providers.google.cloud.operators.dataproc import DataprocSubmitJobOperator
+from airflow.providers.google.cloud.hooks.dataproc import DataprocHook
+from airflow.providers.google.cloud.utils.dataproc import DataProcJobBuilder
+
+
+class SparkServiceSubmit(DataprocSubmitJobOperator):
+    template_fields = (
+        "project_id",
+        "region",
+        "cluster_name",
+        "main_python_file_uri",
+        "args",
+        "job_name",
+    )
+
+    def __init__(
+        self,
+        *,
+        project_id: str,
+        region: str,
+        cluster_name: str,
+        main_python_file_uri: str,
+        args: Optional[Iterable[str]] = None,
+        job_name: Optional[str] = None,
+        gcp_conn_id: str = "google_cloud_default",
+        labels: Optional[Dict[str, str]] = None,
+        properties: Optional[Dict[str, str]] = None,
+        python_files: Optional[Iterable[str]] = None,
+        files: Optional[Iterable[str]] = None,
+        archives: Optional[Iterable[str]] = None,
+        jars: Optional[Iterable[str]] = None,
+        service_account: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        # Initialize parent with a placeholder job; we will set self.job in execute().
+        super().__init__(
+            task_id=kwargs.get("task_id", "spark_service_submit"),
+            project_id=project_id,
+            region=region,
+            job={},  # will be filled in execute()
+            gcp_conn_id=gcp_conn_id,
+            **{k: v for k, v in kwargs.items() if k != "task_id"},
+        )
+        self.cluster_name = cluster_name
+        self.main_python_file_uri = main_python_file_uri
+        self.args = list(args or [])
+        self.job_name = job_name
+        self.labels = labels or {}
+        self.properties = properties or {}
+        self.python_files = list(python_files or [])
+        self.files = list(files or [])
+        self.archives = list(archives or [])
+        self.jars = list(jars or [])
+        self.service_account = service_account
+
+    def execute(self, context: Context) -> Dict[str, Any]:
+        # Build job with DataProcJobBuilder (your preference)…
+        builder = DataProcJobBuilder(
+            job_name=self.job_name,
+            cluster_name=self.cluster_name,
+            project_id=self.project_id,
+            labels=self.labels,
+            region=self.region,
+        )
+        builder.set_pyspark_job(
+            main=self.main_python_file_uri,
+            args=self.args or None,
+            jars=self.jars or None,
+            files=self.files or None,
+            archives=self.archives or None,
+            python_files=self.python_files or None,
+            properties=self.properties or None,
+            service_account=self.service_account or None,
+        )
+        job_payload = builder.build()
+
+        # Log a gcloud-equivalent before submit
+        self._log_gcloud_cli_equivalent(job_payload)
+
+        # Hand off to the parent operator for submit + wait
+        self.job = job_payload
+        result = super().execute(context)
+
+        # Optional: post-process status using your helper
+        state, details = self.__get_status(result)
+        self.log.info("Final state: %s%s", state, f" ({details})" if details else "")
+        return result
+
+    # ---------- Your helpers ----------
+
+    def _log_gcloud_cli_equivalent(self, job: Dict[str, Any]) -> None:
+        project = self.project_id
+        region = self.region
+        cluster = job.get("placement", {}).get("clusterName") or self.cluster_name
+        pyspark = job.get("pysparkJob", {})
+        main = pyspark.get("mainPythonFileUri") or self.main_python_file_uri
+
+        args = pyspark.get("args", []) or self.args
+        jars = pyspark.get("jarFileUris", []) or self.jars
+        files = pyspark.get("fileUris", []) or self.files
+        archives = pyspark.get("archiveUris", []) or self.archives
+        pyfiles = pyspark.get("pythonFileUris", []) or self.python_files
+        props = job.get("properties") or self.properties
+
+        parts = [
+            "gcloud dataproc jobs submit pyspark",
+            self._shq(main),
+            f"--cluster={self._shq(cluster)}",
+            f"--region={self._shq(region)}",
+            f"--project={self._shq(project)}",
+        ]
+        for k, v in (props or {}).items():
+            parts.append(f"--properties={self._shq(f'{k}={v}')}")
+        for j in jars:
+            parts.append(f"--jars={self._shq(j)}")
+        for f in files:
+            parts.append(f"--files={self._shq(f)}")
+        for a in archives:
+            parts.append(f"--archives={self._shq(a)}")
+        for p in pyfiles:
+            parts.append(f"--py-files={self._shq(p)}")
+        if args:
+            parts.append("-- " + " ".join(self._shq(x) for x in args))
+
+        self.log.info("gcloud equivalent:\n%s", " ".join(parts))
+
+    def __get_status(self, job: Dict[str, Any]) -> tuple[str, Optional[str]]:
+        try:
+            status = job.get("status", {})
+            return str(status.get("state") or "UNKNOWN"), status.get("details")
+        except Exception:
+            status = getattr(job, "status", None)
+            return (str(getattr(status, "state", "UNKNOWN")), getattr(status, "details", None))
+
+    @staticmethod
+    def _shq(s: Any) -> str:
+        t = str(s)
+        if not t or any(c.isspace() for c in t) or any(c in t for c in "\"'\\$`"):
+            return "'" + t.replace("'", "'\"'\"'") + "'"
+        return t
