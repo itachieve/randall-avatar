@@ -1,0 +1,33 @@
+import subprocess
+import os
+from typing import Optional
+
+class GitService:
+    def __init__(self, git_executable: str = "git"):
+        self.git = git_executable
+
+    def clone(self, repo_url: str, dest_path: str, ref: Optional[str] = None) -> str:
+        """
+        Clone a git repository into dest_path. Optionally checkout a ref (branch, tag, or commit).
+
+        Args:
+            repo_url: Full URL to the repository (with credentials embedded if needed).
+            dest_path: Local path where repo should be cloned.
+            ref: Optional branch/tag/commit to checkout.
+
+        Returns:
+            The local path where the repo was cloned.
+        """
+        if not os.path.exists(dest_path):
+            os.makedirs(dest_path, exist_ok=True)
+
+        # Clone repo (shallow if you like; here it's full clone)
+        subprocess.run(
+            [self.git, "clone", repo_url, dest_path],
+            check=True
+        )
+
+        if ref:
+            subprocess.run([self.git, "-C", dest_path, "checkout", ref], check=True)
+
+        return dest_path
