@@ -1,0 +1,196 @@
+Awesome—here’s a compact, production-friendly `PySparkFiles` that:
+
+- discovers mains by glob (e.g., `jobs/*_main.py`)
+- zips shared dirs (e.g., `["mypkg", "libs"]`) while honoring simple exclude patterns
+- uploads the shared zip + each main to GCS via your `GCSService`
+- returns a **manifest** dict you can feed into `PySparkConfig`
+
+```python
+from __future__ import annotations
+import io
+import os
+import glob
+import fnmatch
+import zipfile
+import hashlib
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PySparkFiles:
+    """
+    Prepare and stage PySpark mains + shared deps to GCS, then return a manifest.
+
+    Assumptions:
+      - Repo already exists locally (cloned by your GitService).
+      - GCSService exposes:
+          upload_bytes(path: str, data: bytes, content_type: str) -> str  # returns gs://...
+          upload_file(path: str, local_path: str, content_type: str) -> str
+
+    Typical repo layout:
+      repo/
+        jobs/
+          job_a_main.py
+          job_b_main.py
+        mypkg/
+          __init__.py
+          ...
+    """
+    gcs_service: object               # your GCSService instance
+    bucket: str                       # e.g., "my-bucket"
+    prefix: str                       # e.g., "jobs/my_app"
+    version: str                      # e.g., commit SHA or ts like 20250815T211000
+    mains_glob: str = "jobs/*_main.py"
+    shared_dirs: List[str] = field(default_factory=lambda: ["mypkg"])
+    excludes: List[str] = field(default_factory=list)  # e.g., ["**/tests/**", "*.md"]
+    extra_python_files: List[str] = field(default_factory=list)  # extra pre-existing gs:// zips
+
+    # populated after stage()
+    deps_uri: Optional[str] = None
+    mains_map: Dict[str, str] = field(default_factory=dict)
+
+    def stage(self, repo_path: str) -> Dict:
+        """
+        Build and upload a shared deps zip, upload each main .py, and return a manifest.
+
+        Manifest example:
+        {
+          "deps_uri": "gs://bucket/prefix/deps/shared_<version>.zip",
+          "mains_map": {"job_a_main": "gs://bucket/prefix/mains/job_a_main_<version>.py"},
+          "all_python_files": ["gs://.../deps/shared_<version>.zip", ...extra_python_files],
+          "metadata": {"shared_zip_bytes": 12345, "shared_zip_md5": "abcd..."}
+        }
+        """
+        repo_path = os.path.abspath(repo_path)
+        if not os.path.isdir(repo_path):
+            raise FileNotFoundError(f"Repo path does not exist or is not a directory: {repo_path}")
+
+        mains = self._find_mains(repo_path)
+        if not mains:
+            raise FileNotFoundError(f"No main files matched '{self.mains_glob}' under {repo_path}")
+
+        # 1) Build shared deps zip (in-memory)
+        shared_zip_bytes = self._build_shared_zip(repo_path)
+        zip_md5 = hashlib.md5(shared_zip_bytes).hexdigest()  # noqa: S324 (non-crypto usage)
+
+        # 2) Upload deps zip
+        deps_blob_path = f"{self.prefix}/deps/shared_{self.version}.zip"
+        self.deps_uri = self.gcs_service.upload_bytes(
+            path=f"{self.bucket}/{deps_blob_path}",
+            data=shared_zip_bytes,
+            content_type="application/zip",
+        )
+
+        # 3) Upload each main
+        for local_main in mains:
+            base = os.path.splitext(os.path.basename(local_main))[0]  # e.g., job_a_main
+            blob_path = f"{self.prefix}/mains/{base}_{self.version}.py"
+            gs_uri = self.gcs_service.upload_file(
+                path=f"{self.bucket}/{blob_path}",
+                local_path=local_main,
+                content_type="text/x-python",
+            )
+            self.mains_map[base] = gs_uri
+
+        all_python_files = [self.deps_uri] + list(self.extra_python_files)
+
+        logger.info(
+            "Staged PySpark files: mains=%s, deps=%s (size=%d, md5=%s)",
+            sorted(self.mains_map.keys()),
+            self.deps_uri,
+            len(shared_zip_bytes),
+            zip_md5,
+        )
+
+        return {
+            "deps_uri": self.deps_uri,
+            "mains_map": dict(self.mains_map),
+            "all_python_files": all_python_files,
+            "metadata": {
+                "shared_zip_bytes": len(shared_zip_bytes),
+                "shared_zip_md5": zip_md5,
+                "version": self.version,
+                "bucket": self.bucket,
+                "prefix": self.prefix,
+            },
+        }
+
+    # -------- internals --------
+
+    def _find_mains(self, repo_path: str) -> List[str]:
+        pattern = os.path.join(repo_path, self.mains_glob)
+        mains = sorted(glob.glob(pattern))
+        # sanity: ensure .py files
+        for p in mains:
+            if not p.endswith(".py"):
+                raise ValueError(f"Main must be a .py file: {p}")
+        if not mains:
+            logger.warning("No mains found using pattern: %s", pattern)
+        else:
+            logger.info("Discovered mains: %s", [os.path.basename(m) for m in mains])
+        return mains
+
+    def _build_shared_zip(self, repo_path: str) -> bytes:
+        """
+        Zip shared_dirs relative to repo root, honoring excludes and skipping mains.
+        Returns the zip as bytes (for upload_bytes).
+        """
+        buf = io.BytesIO()
+        mains_set = set(self._relative(p, repo_path) for p in self._find_mains(repo_path))
+
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            any_added = False
+            for d in self.shared_dirs:
+                abs_dir = os.path.join(repo_path, d)
+                if not os.path.isdir(abs_dir):
+                    logger.warning("Shared dir missing, skipping: %s", abs_dir)
+                    continue
+
+                for root, _, files in os.walk(abs_dir):
+                    for fn in files:
+                        local_path = os.path.join(root, fn)
+                        rel_path = self._relative(local_path, repo_path)
+
+                        if self._should_exclude(rel_path):
+                            continue
+                        if rel_path in mains_set:
+                            # never include mains inside deps zip
+                            continue
+
+                        zf.write(local_path, arcname=rel_path)
+                        any_added = True
+
+            if not any_added:
+                # empty zip is still okay; Dataproc accepts an empty deps zip
+                logger.info("No files added to shared zip (check shared_dirs/excludes).")
+
+        buf.seek(0)
+        return buf.read()
+
+    def _should_exclude(self, rel_path: str) -> bool:
+        # match against provided glob patterns (relative to repo root)
+        for pat in self.excludes:
+            # support both plain and ** patterns
+            if fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(rel_path.replace("\\", "/"), pat):
+                return True
+        return False
+
+    @staticmethod
+    def _relative(path: str, root: str) -> str:
+        rel = os.path.relpath(path, root)
+        # normalize to forward slashes for consistency in zips
+        return rel.replace("\\", "/")
+```
+
+### Notes
+- **Inputs**: `bucket` should be the *bucket name only* (e.g., `"my-bucket"`); the class constructs `gs://my-bucket/...` via your `GCSService`.
+- **Versioning**: every artifact is stored under `.../deps/shared_<version>.zip` and `.../mains/<name>_<version>.py` for reproducibility.
+- **Excludes**: simple glob patterns relative to the repo root (supports `**`).
+- **Empty zip**: allowed; Dataproc will still run if your job doesn’t need shared deps.
+- **Manifest**: you get `deps_uri`, `mains_map`, `all_python_files`, and some `metadata`.
+
+If you want, I can also provide a minimal `GCSService` that matches the `upload_bytes` / `upload_file` signatures used here.
