@@ -1,0 +1,29 @@
+try:
+    print("Checking on the Driver...")
+    print(f"Contents of working directory: {os.listdir(os.getcwd())}")
+    with open("my_archive.zip/data.txt", "r") as f:
+        print(f.read())
+except FileNotFoundError:
+    print("File not found on the driver. The archive was not extracted here.")
+
+# Spark transformation - runs on the executor
+def read_archive_content(x):
+    # THIS SHOULD SUCCEED
+    try:
+        extracted_path = os.path.join(os.getcwd(), "my_archive.zip")
+        with open(os.path.join(extracted_path, "data.txt"), "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "File not found on the executor."
+
+if __name__ == "__main__":
+    sc = pyspark.SparkContext()
+    
+    rdd = sc.parallelize([1])
+    
+    results = rdd.map(read_archive_content).collect()
+    
+    print("\nResults from the Executor:")
+    print(results)
+    
+    sc.stop()
