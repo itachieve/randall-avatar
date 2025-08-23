@@ -1,29 +1,61 @@
-try:
-    print("Checking on the Driver...")
-    print(f"Contents of working directory: {os.listdir(os.getcwd())}")
-    with open("my_archive.zip/data.txt", "r") as f:
-        print(f.read())
-except FileNotFoundError:
-    print("File not found on the driver. The archive was not extracted here.")
+import pyspark
+import sys
 
-# Spark transformation - runs on the executor
-def read_archive_content(x):
-    # THIS SHOULD SUCCEED
+# ==============================================================================
+# --- This part of the code runs on the Spark Driver ---
+# ==============================================================================
+
+print("\n--- Testing from the Spark Driver (Master Node) ---")
+print(f"Driver's sys.path: {sys.path}")
+
+# Test: Can we import the spacy core library?
+# This should succeed because `--py-files` adds the zip to the PYTHONPATH for both driver and executors.
+try:
+    import spacy
+    print("✅ SUCCESS: spaCy module was successfully imported on the driver.")
+    spacy_version = spacy.__version__
+    print(f"   -> spaCy version: {spacy_version}")
+except ImportError as e:
+    print(f"❌ FAIL: spaCy module could NOT be imported on the driver. Error: {e}")
+
+
+# ==============================================================================
+# --- This part of the code runs on the Spark Executor(s) ---
+# ==============================================================================
+
+def test_on_executor(x):
+    """
+    This function is sent to and executed on the worker nodes (executors).
+    """
+    # Test: Can we import the spaCy core library on the executor?
     try:
-        extracted_path = os.path.join(os.getcwd(), "my_archive.zip")
-        with open(os.path.join(extracted_path, "data.txt"), "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        return "File not found on the executor."
+        import spacy
+        spacy_import_status = "SUCCESS"
+        spacy_import_error = None
+    except ImportError as e:
+        spacy_import_status = "FAIL"
+        spacy_import_error = str(e)
+    
+    return (
+        f"spaCy Import Status: {spacy_import_status}",
+        f"spaCy Import Error: {spacy_import_error}"
+    )
 
 if __name__ == "__main__":
-    sc = pyspark.SparkContext()
+    spark = pyspark.sql.SparkSession.builder.appName("SpacyImportTest").getOrCreate()
+    sc = spark.sparkContext
     
-    rdd = sc.parallelize([1])
+    # Create an RDD to run the test function on the executors.
+    test_rdd = sc.parallelize([1])
     
-    results = rdd.map(read_archive_content).collect()
+    print("\n--- Starting Spark Task on Executor(s) ---")
     
-    print("\nResults from the Executor:")
-    print(results)
+    # Collect the results from all executors
+    results = test_rdd.map(test_on_executor).collect()
     
-    sc.stop()
+    print("\n--- Results from Executor(s) ---")
+    for result in results:
+        for line in result:
+            print(f"   -> {line}")
+
+    spark.stop()
